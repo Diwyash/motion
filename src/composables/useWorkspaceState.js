@@ -41,6 +41,18 @@ const tabUrl = (tab) => {
   }
 };
 
+const normalizeUrlForComparison = (url) => {
+  if (!url || url === 'No URL') {
+    return '';
+  }
+
+  try {
+    return new URL(url).href;
+  } catch {
+    return String(url).trim();
+  }
+};
+
 const normalizeTabSnapshot = (tab) => ({
   tabId: typeof tab.id === 'number' ? tab.id : null,
   windowId: typeof tab.windowId === 'number' ? tab.windowId : null,
@@ -237,6 +249,45 @@ const focusTab = async (tab) => {
   }
 };
 
+const openSavedTab = async (tabItem) => {
+  if (!canUseChromeTabs()) {
+    return;
+  }
+
+  const targetUrl = tabItem?.url;
+
+  if (!targetUrl || targetUrl === 'No URL') {
+    return;
+  }
+
+  if (typeof tabItem?.tabId === 'number') {
+    try {
+      const existingTab = await chrome.tabs.get(tabItem.tabId);
+
+      if (existingTab) {
+        await focusTab(existingTab);
+        return;
+      }
+    } catch {
+      // Fall back to searching by URL below.
+    }
+  }
+
+  const matchingTabs = await chrome.tabs.query({ url: targetUrl });
+  const matchingTab = matchingTabs[0];
+
+  if (matchingTab) {
+    await focusTab(matchingTab);
+    return;
+  }
+
+  const createdTab = await chrome.tabs.create({ url: targetUrl, active: true });
+
+  if (createdTab) {
+    await focusTab(createdTab);
+  }
+};
+
 const getDragPayload = (event) => {
   const rawPayload = event.dataTransfer?.getData('application/json') || event.dataTransfer?.getData('text/plain');
 
@@ -327,6 +378,46 @@ const findItemLocationByTabId = (tabId) => {
   return null;
 };
 
+const findItemLocationByUrl = (url) => {
+  const normalizedUrl = normalizeUrlForComparison(url);
+
+  if (!normalizedUrl) {
+    return null;
+  }
+
+  for (const group of groups.value) {
+    const groupItems = Array.isArray(group.items) ? group.items : [];
+    const itemIndex = groupItems.findIndex((item) => normalizeUrlForComparison(item.url) === normalizedUrl);
+
+    if (itemIndex !== -1) {
+      return {
+        groupId: group.id,
+        itemId: groupItems[itemIndex].id
+      };
+    }
+  }
+
+  return null;
+};
+
+const groupContainsUrl = (groupId, url, excludeItemId = null) => {
+  const group = groups.value.find((entry) => entry.id === groupId);
+
+  if (!group) {
+    return false;
+  }
+
+  const normalizedUrl = normalizeUrlForComparison(url);
+
+  if (!normalizedUrl) {
+    return false;
+  }
+
+  const groupItems = Array.isArray(group.items) ? group.items : [];
+
+  return groupItems.some((item) => item.id !== excludeItemId && normalizeUrlForComparison(item.url) === normalizedUrl);
+};
+
 const findItemLocationByItemId = (itemId) => {
   for (const group of groups.value) {
     const groupItems = Array.isArray(group.items) ? group.items : [];
@@ -360,6 +451,11 @@ const moveGroupItem = (itemId, fromGroupId, toGroupId, targetIndex = null) => {
   }
 
   const [movedItem] = sourceItems.splice(sourceItemIndex, 1);
+  if (groupContainsUrl(toGroupId, movedItem.url, movedItem.id)) {
+    sourceItems.splice(sourceItemIndex, 0, movedItem);
+    return;
+  }
+
   const targetGroup = groups.value[targetGroupIndex];
   const targetItems = ensureGroupItems(targetGroup);
 
@@ -376,6 +472,10 @@ const moveGroupItem = (itemId, fromGroupId, toGroupId, targetIndex = null) => {
 const addTabToGroup = (groupId, tab, targetIndex = null) => {
   const tabSnapshot = normalizeTabSnapshot(tab);
 
+  if (groupContainsUrl(groupId, tabSnapshot.url)) {
+    return;
+  }
+
   if (tabSnapshot.tabId !== null) {
     const existingLocation = findItemLocationByTabId(tabSnapshot.tabId);
 
@@ -383,6 +483,12 @@ const addTabToGroup = (groupId, tab, targetIndex = null) => {
       moveGroupItem(existingLocation.itemId, existingLocation.groupId, groupId, targetIndex);
       return;
     }
+  }
+
+  const existingUrlLocation = findItemLocationByUrl(tabSnapshot.url);
+
+  if (existingUrlLocation) {
+    return;
   }
 
   insertItemIntoGroup(groupId, {
@@ -500,6 +606,7 @@ export const useWorkspaceState = () => ({
   moveGroup,
   moveDraggedItem,
   endTabDrag,
+  openSavedTab,
   openPanel,
   renameGroup,
   startTabDrag,
