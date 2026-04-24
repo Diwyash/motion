@@ -1,6 +1,12 @@
 import { ref, watch } from 'vue';
 
-const STORAGE_KEY = 'motion-workspace-v1';
+const STORAGE_META_KEY = 'motion-workspace-sync-v3';
+const STORAGE_GROUPS_CHUNK_PREFIX = 'motion-workspace-groups-v3-';
+const STORAGE_TABS_CHUNK_PREFIX = 'motion-workspace-tabs-v3-';
+const LEGACY_SYNC_GROUPS_KEY = 'motion-workspace-groups-v2';
+const LEGACY_SYNC_TABS_KEY = 'motion-workspace-tabs-v2';
+const LEGACY_STORAGE_KEY = 'motion-workspace-v1';
+const SYNC_ITEM_BUDGET = 7600;
 
 const currentTabs = ref([]);
 const groups = ref([]);
@@ -13,16 +19,55 @@ let initializationPromise = null;
 let persistenceRegistered = false;
 let chromeListenersRegistered = false;
 let isHydrating = false;
+let saveGroupsPromise = Promise.resolve();
+const textEncoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
+const issuedIds = new Set();
+let nextIdCursor = Math.floor(Math.random() * 100000);
 
 const canUseChromeTabs = () => typeof chrome !== 'undefined' && Boolean(chrome.tabs?.query);
-const canUseChromeStorage = () => typeof chrome !== 'undefined' && Boolean(chrome.storage?.local);
+const canUseChromeSyncStorage = () => typeof chrome !== 'undefined' && Boolean(chrome.storage?.sync);
+const canUseChromeLocalStorage = () => typeof chrome !== 'undefined' && Boolean(chrome.storage?.local);
 
-const createId = () => {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
+const registerKnownId = (id) => {
+  if (id === null || id === undefined || id === '') {
+    return '';
   }
 
-  return `motion-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const normalizedId = String(id);
+  issuedIds.add(normalizedId);
+  return normalizedId;
+};
+
+const registerWorkspaceIds = () => {
+  for (const group of groups.value) {
+    registerKnownId(group?.id);
+
+    if (!Array.isArray(group?.items)) {
+      continue;
+    }
+
+    for (const item of group.items) {
+      registerKnownId(item?.id);
+    }
+  }
+};
+
+const createId = () => {
+  registerWorkspaceIds();
+
+  for (let attempt = 0; attempt < 100000; attempt += 1) {
+    const candidate = String((nextIdCursor + attempt) % 100000).padStart(5, '0');
+
+    if (issuedIds.has(candidate)) {
+      continue;
+    }
+
+    issuedIds.add(candidate);
+    nextIdCursor = (Number(candidate) + 1) % 100000;
+    return candidate;
+  }
+
+  throw new Error('No available 5-digit IDs remain.');
 };
 
 const tabTitle = (tab) => tab.title || tab.pendingTitle || 'Untitled tab';
@@ -53,12 +98,36 @@ const normalizeUrlForComparison = (url) => {
   }
 };
 
+const resolveFavIconUrl = (url, fallback = '') => {
+  if (fallback) {
+    return fallback;
+  }
+
+  const normalizedUrl = normalizeUrlForComparison(url);
+
+  if (!normalizedUrl) {
+    return '';
+  }
+
+  try {
+    const parsedUrl = new URL(normalizedUrl);
+
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+      return '';
+    }
+
+    return `https://www.google.com/s2/favicons?domain_url=${encodeURIComponent(parsedUrl.origin)}&sz=32`;
+  } catch {
+    return '';
+  }
+};
+
 const normalizeTabSnapshot = (tab) => ({
   tabId: typeof tab.id === 'number' ? tab.id : null,
   windowId: typeof tab.windowId === 'number' ? tab.windowId : null,
   title: tabTitle(tab),
   url: tabUrl(tab),
-  favIconUrl: tab.favIconUrl || ''
+  favIconUrl: resolveFavIconUrl(tabUrl(tab), tab.favIconUrl || '')
 });
 
 const cloneTabForGroup = (tab) => ({
@@ -67,50 +136,277 @@ const cloneTabForGroup = (tab) => ({
 });
 
 const normalizeGroupItem = (item) => ({
-  id: item.id || createId(),
+  id: registerKnownId(item.id) || createId(),
   tabId: typeof item.tabId === 'number' ? item.tabId : null,
   windowId: typeof item.windowId === 'number' ? item.windowId : null,
   title: item.title || 'Untitled tab',
   url: item.url || 'No URL',
-  favIconUrl: item.favIconUrl || ''
+  favIconUrl: resolveFavIconUrl(item.url || 'No URL', item.favIconUrl || '')
 });
 
 const normalizeGroup = (group, index) => ({
-  id: group.id || createId(),
+  id: registerKnownId(group.id) || createId(),
   name: (group.name || '').trim() || `Group ${index + 1}`,
   isCollapsed: Boolean(group.isCollapsed),
   items: Array.isArray(group.items) ? group.items.map(normalizeGroupItem) : []
 });
 
-const serializeGroups = () => groups.value.map((group) => ({
-  id: group.id,
-  name: group.name,
-  isCollapsed: Boolean(group.isCollapsed),
-  items: Array.isArray(group.items) ? group.items.map((item) => ({ ...item })) : []
-}));
+const getSerializedSize = (value) => {
+  const serializedValue = JSON.stringify(value);
+
+  return textEncoder ? textEncoder.encode(serializedValue).length : serializedValue.length;
+};
+
+const createChunkKey = (prefix, index) => `${prefix}${index}`;
+
+const chunkArrayForSync = (entries, prefix) => {
+  const chunks = [];
+  let currentChunk = [];
+
+  for (const entry of entries) {
+    const nextChunk = [...currentChunk, entry];
+    const estimatedSize = getSerializedSize(nextChunk) + createChunkKey(prefix, chunks.length).length;
+
+    if (currentChunk.length && estimatedSize > SYNC_ITEM_BUDGET) {
+      chunks.push(currentChunk);
+      currentChunk = [entry];
+      continue;
+    }
+
+    currentChunk = nextChunk;
+  }
+
+  if (currentChunk.length) {
+    chunks.push(currentChunk);
+  }
+
+  return chunks;
+};
+
+const flattenChunkedArrays = (chunkedValues) => chunkedValues.flatMap((value) => (Array.isArray(value) ? value : []));
+
+const normalizeStoredTabEntry = (entry, fallbackId = '') => {
+  if (Array.isArray(entry)) {
+    return {
+      id: registerKnownId(entry[0] || fallbackId) || createId(),
+      title: entry[1] || 'Untitled tab',
+      url: entry[2] || 'No URL'
+    };
+  }
+
+  return {
+    id: registerKnownId(entry?.id || fallbackId) || createId(),
+    title: entry?.title || 'Untitled tab',
+    url: entry?.url || 'No URL'
+  };
+};
+
+const serializeWorkspace = () => {
+  const tabs = [];
+  const tabIndexById = new Map();
+  const serializedGroups = groups.value.map((group) => {
+    const itemIndexes = [];
+
+    if (Array.isArray(group.items)) {
+      for (const item of group.items) {
+        if (!item?.id) {
+          continue;
+        }
+
+        let tabIndex = tabIndexById.get(item.id);
+
+        if (tabIndex === undefined) {
+          tabIndex = tabs.length;
+          tabs.push([
+            item.id,
+            item.title || 'Untitled tab',
+            item.url || 'No URL'
+          ]);
+          tabIndexById.set(item.id, tabIndex);
+        }
+
+        itemIndexes.push(tabIndex);
+      }
+    }
+
+    return [
+      group.id,
+      group.name,
+      Boolean(group.isCollapsed) ? 1 : 0,
+      itemIndexes
+    ];
+  });
+
+  return {
+    serializedGroups,
+    tabs
+  };
+};
+
+const hydrateGroupsFromCollections = (storedGroups, storedTabs) => {
+  if (!Array.isArray(storedGroups)) {
+    return [];
+  }
+
+  const tabEntries = Array.isArray(storedTabs)
+    ? storedTabs.map((entry) => normalizeStoredTabEntry(entry))
+    : [];
+  const legacyTabEntries = !Array.isArray(storedTabs) && storedTabs && typeof storedTabs === 'object'
+    ? storedTabs
+    : null;
+
+  return storedGroups.map((group, index) => {
+    if (Array.isArray(group)) {
+      const itemIndexes = Array.isArray(group[3]) ? group[3] : [];
+
+      return {
+        id: registerKnownId(group[0]) || createId(),
+        name: (group[1] || '').trim() || `Group ${index + 1}`,
+        isCollapsed: Boolean(group[2]),
+        items: itemIndexes
+          .map((itemIndex) => tabEntries[itemIndex] || null)
+          .filter(Boolean)
+          .map((item) => normalizeStoredTabEntry(item))
+          .map(normalizeGroupItem)
+      };
+    }
+
+    return {
+      id: registerKnownId(group?.id) || createId(),
+      name: (group?.name || '').trim() || `Group ${index + 1}`,
+      isCollapsed: Boolean(group?.isCollapsed),
+      items: Array.isArray(group?.itemIds)
+        ? group.itemIds
+          .map((itemId) => {
+            const entry = legacyTabEntries?.[itemId];
+
+            return entry ? normalizeStoredTabEntry(entry, itemId) : null;
+          })
+          .filter(Boolean)
+          .map(normalizeGroupItem)
+        : Array.isArray(group?.items)
+          ? group.items.map(normalizeGroupItem)
+          : []
+    };
+  });
+};
+
+const getChunkKeys = (prefix, count) => Array.from({ length: count }, (_, index) => createChunkKey(prefix, index));
+
+const loadChunkedCollection = async (prefix, count) => {
+  if (!count) {
+    return [];
+  }
+
+  const chunkKeys = getChunkKeys(prefix, count);
+  const result = await chrome.storage.sync.get(chunkKeys);
+
+  return flattenChunkedArrays(chunkKeys.map((key) => result?.[key]));
+};
 
 const saveGroups = async () => {
-  if (!canUseChromeStorage()) {
+  if (!canUseChromeSyncStorage()) {
     return;
   }
 
-  await chrome.storage.local.set({ [STORAGE_KEY]: serializeGroups() });
+  const { serializedGroups, tabs } = serializeWorkspace();
+  const groupChunks = chunkArrayForSync(serializedGroups, STORAGE_GROUPS_CHUNK_PREFIX);
+  const tabChunks = chunkArrayForSync(tabs, STORAGE_TABS_CHUNK_PREFIX);
+  const previousMetaResult = await chrome.storage.sync.get(STORAGE_META_KEY);
+  const previousMeta = previousMetaResult?.[STORAGE_META_KEY] || {};
+  const payload = {
+    [STORAGE_META_KEY]: {
+      groupChunkCount: groupChunks.length,
+      tabChunkCount: tabChunks.length
+    }
+  };
+
+  groupChunks.forEach((chunk, index) => {
+    payload[createChunkKey(STORAGE_GROUPS_CHUNK_PREFIX, index)] = chunk;
+  });
+
+  tabChunks.forEach((chunk, index) => {
+    payload[createChunkKey(STORAGE_TABS_CHUNK_PREFIX, index)] = chunk;
+  });
+
+  await chrome.storage.sync.set(payload);
+
+  const staleKeys = [
+    ...getChunkKeys(STORAGE_GROUPS_CHUNK_PREFIX, Math.max(0, Number(previousMeta.groupChunkCount || 0) - groupChunks.length)).map((_, offset) => createChunkKey(STORAGE_GROUPS_CHUNK_PREFIX, groupChunks.length + offset)),
+    ...getChunkKeys(STORAGE_TABS_CHUNK_PREFIX, Math.max(0, Number(previousMeta.tabChunkCount || 0) - tabChunks.length)).map((_, offset) => createChunkKey(STORAGE_TABS_CHUNK_PREFIX, tabChunks.length + offset)),
+    LEGACY_SYNC_GROUPS_KEY,
+    LEGACY_SYNC_TABS_KEY
+  ];
+
+  if (staleKeys.length) {
+    await chrome.storage.sync.remove(staleKeys);
+  }
+
+  if (canUseChromeLocalStorage()) {
+    await chrome.storage.local.remove(LEGACY_STORAGE_KEY);
+  }
+};
+
+const persistGroups = async () => {
+  if (isHydrating || !canUseChromeSyncStorage()) {
+    return;
+  }
+
+  saveGroupsPromise = saveGroupsPromise
+    .catch(() => {})
+    .then(() => saveGroups());
+
+  await saveGroupsPromise;
 };
 
 const loadGroups = async () => {
-  if (!canUseChromeStorage()) {
+  if (!canUseChromeSyncStorage()) {
     groups.value = [];
     return;
   }
 
-  const result = await chrome.storage.local.get(STORAGE_KEY);
-  const storedGroups = result?.[STORAGE_KEY];
+  const metaResult = await chrome.storage.sync.get(STORAGE_META_KEY);
+  const syncMeta = metaResult?.[STORAGE_META_KEY];
+
+  let nextGroups = [];
+  let shouldMigrate = false;
+  const hasChunkedSyncSnapshot = syncMeta
+    && Number.isInteger(syncMeta.groupChunkCount)
+    && Number.isInteger(syncMeta.tabChunkCount);
+
+  if (hasChunkedSyncSnapshot) {
+    const [storedGroups, storedTabs] = await Promise.all([
+      loadChunkedCollection(STORAGE_GROUPS_CHUNK_PREFIX, Number(syncMeta.groupChunkCount || 0)),
+      loadChunkedCollection(STORAGE_TABS_CHUNK_PREFIX, Number(syncMeta.tabChunkCount || 0))
+    ]);
+
+    nextGroups = hydrateGroupsFromCollections(storedGroups, storedTabs);
+  } else {
+    const legacySyncResult = await chrome.storage.sync.get([LEGACY_SYNC_GROUPS_KEY, LEGACY_SYNC_TABS_KEY]);
+    const legacySyncGroups = legacySyncResult?.[LEGACY_SYNC_GROUPS_KEY];
+    const legacySyncTabs = legacySyncResult?.[LEGACY_SYNC_TABS_KEY];
+
+    nextGroups = hydrateGroupsFromCollections(legacySyncGroups, legacySyncTabs);
+    shouldMigrate = nextGroups.length > 0;
+  }
+
+  if (!nextGroups.length && canUseChromeLocalStorage()) {
+    const legacyResult = await chrome.storage.local.get(LEGACY_STORAGE_KEY);
+    const legacyGroups = legacyResult?.[LEGACY_STORAGE_KEY];
+
+    if (Array.isArray(legacyGroups) && legacyGroups.length) {
+      nextGroups = legacyGroups.map((group, index) => normalizeGroup(group, index));
+      shouldMigrate = true;
+    }
+  }
 
   isHydrating = true;
-  groups.value = Array.isArray(storedGroups)
-    ? storedGroups.map((group, index) => normalizeGroup(group, index))
-    : [];
+  groups.value = nextGroups;
   isHydrating = false;
+
+  if (nextGroups.length && shouldMigrate) {
+    await saveGroups();
+  }
 };
 
 const syncGroupedTabsWithCurrentTabs = () => {
@@ -159,13 +455,9 @@ const registerPersistence = () => {
   persistenceRegistered = true;
 
   watch(
-    groups,
+    () => serializeWorkspace(),
     async () => {
-      if (isHydrating) {
-        return;
-      }
-
-      await saveGroups();
+      await persistGroups();
     },
     { deep: true }
   );
