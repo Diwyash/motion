@@ -228,8 +228,12 @@
   gap: 0;
   padding: 0;
   background: rgba(255, 255, 255, 0.92);
-  overflow: hidden;
-  backdrop-filter: blur(8px);
+  box-shadow: rgba(0, 0, 0, 0.1) 0px 1px 3px, rgba(0, 0, 0, 0.15) 0px 1px 2px;
+  border-radius: 4px;
+
+  &--expanded {
+    height: 100%;
+  }
 
   &__header {
     display: flex;
@@ -239,8 +243,14 @@
     padding: 0 12px;
     background: #ffffff;
     color: #000000;
-    border-radius: 6px;
-    border: 1px solid #9ca3af;
+    border-radius: 4px 4px 0 0;
+    width: 100%;
+  }
+
+  &--selected {
+    .group-card__header {
+      background: linear-gradient(90deg, rgba(245, 41, 41, 0.456), rgba(239, 68, 68, 0));
+    }
   }
 
   &__drag-handle {
@@ -281,6 +291,20 @@
       4px 8px 0 #000000;
   }
 
+  &__header-shortcut {
+    width: 14px;
+    height: 14px;
+    display: inline-grid;
+    place-items: center;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+    color: #111827;
+    border: 1px solid rgba(17, 24, 39, 0.35);
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.72);
+  }
+
   &__title {
     margin: 0;
     flex: 1;
@@ -292,7 +316,7 @@
     font-weight: 700;
     color: #000000;
     line-height: 1;
-    cursor: text;
+    cursor: pointer;
   }
 
   &__title-input {
@@ -368,7 +392,13 @@
   &__header:hover > button:not(.group-card__drag-handle),
   &__header:focus-within > button:not(.group-card__drag-handle),
   &:hover &__header > button:not(.group-card__drag-handle),
+  &--selected &__header > button:not(.group-card__drag-handle),
   &__item:hover > .group-card__delete-button {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  &__item--selected > .group-card__delete-button {
     opacity: 1;
     pointer-events: auto;
   }
@@ -387,7 +417,7 @@
     flex-direction: column;
     margin: 0;
     list-style: none;
-    padding: 4px 0;
+    padding: 4px;
   }
 
   &__item {
@@ -412,7 +442,7 @@
       content: '';
       position: absolute;
       inset: 0;
-      background: linear-gradient(90deg, rgba(16, 185, 129, 0.12), rgba(16, 185, 129, 0));
+      background: linear-gradient(90deg, rgba(245, 41, 41, 0.456), rgba(239, 68, 68, 0));
       opacity: 0;
       transition: opacity 160ms ease;
       pointer-events: none;
@@ -424,9 +454,9 @@
 
     &:hover {
       transform: translateY(-2px);
-      border: 1px solid #10b981;
-      box-shadow: 0 6px 14px rgba(15, 23, 42, 0.08);
       background: #f8fafc;
+      // border: 1px solid #ef4444;
+      // box-shadow: rgba(0, 0, 0, 0.15) 1.95px 1.95px 2.6px;
     }
 
     &:hover::before,
@@ -437,16 +467,25 @@
     &:focus-visible {
       outline: none;
       transform: translateX(2px);
-      border: 1px solid #10b981;
-      box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.14);
+      border: 1px solid #ef4444;
+      box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.16);
       background: #f8fafc;
+    }
+
+    &--selected {
+      transform: translateY(-2px);
+      background: #f8fafc;
+    }
+
+    &--selected::before {
+      opacity: 1;
     }
   }
 
   &__item-icon {
     flex: 0 0 auto;
-    width: 14px;
-    height: 14px;
+    width: 16px;
+    height: 16px;
     border-radius: 4px;
     object-fit: cover;
     transition: transform 160ms ease, box-shadow 160ms ease;
@@ -454,6 +493,24 @@
 
   &__item-icon--fallback {
     background: linear-gradient(135deg, #cbd5e1, #94a3b8);
+  }
+
+  &__item-shortcut {
+    flex: 0 0 auto;
+    width: 16px;
+    height: 16px;
+    display: inline-grid;
+    place-items: center;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+    color: #111827;
+    border: 1px solid gray;
+    border-radius: 4px;
+  }
+
+  &__item-shortcut--empty {
+    color: transparent;
   }
 
   &__item-content {

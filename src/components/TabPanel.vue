@@ -18,7 +18,6 @@
     <div class="tab-panel__header">
       <div>
         <p class="tab-panel__eyebrow">Browser tabs</p>
-        <h1 class="tab-panel__title">Open tabs</h1>
       </div>
     </div>
 
