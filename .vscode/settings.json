@@ -1,5 +1,9 @@
 {
     "chat.tools.terminal.autoApprove": {
-        "npx --yes eslint@8": true
+        "npx --yes eslint@8": true,
+        "/^Select-String -Path 'c:\\\\Diwyash\\\\stuff\\\\motion\\\\src\\\\components\\\\MainWorkspace\\.scss' -Pattern '\\^\\\\\\.main-workspace__toast-layer\\|\\^\\\\\\.search-popup__stored-result\\|\\^\\\\\\.search-popup__result-meta\\|\\^\\\\\\.search-popup__result-remove\\|\\^\\\\\\.search-popup__result--stored' \\| ForEach-Object \\{ \"\\{0\\}:\\{1\\}\" -f \\$_\\.LineNumber, \\$_\\.Line\\.Trim\\(\\) \\}$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
     }
 }

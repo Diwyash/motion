@@ -1,5 +1,6 @@
 <template>
   <main class="blank-page" aria-label="Motion new tab page">
+    <GlobalTooltip />
     <MainHeader />
     <MainWorkspace />
     <TabPanel />
@@ -8,6 +9,7 @@
 
 <script setup>
 import MainHeader from './components/MainHeader.vue';
+import GlobalTooltip from './components/GlobalTooltip.vue';
 import MainWorkspace from './components/MainWorkspace.vue';
 import TabPanel from './components/TabPanel.vue';
 </script>

@@ -3,13 +3,25 @@ import { ref, watch } from 'vue';
 const STORAGE_META_KEY = 'motion-workspace-sync-v3';
 const STORAGE_GROUPS_CHUNK_PREFIX = 'motion-workspace-groups-v3-';
 const STORAGE_TABS_CHUNK_PREFIX = 'motion-workspace-tabs-v3-';
-const LEGACY_SYNC_GROUPS_KEY = 'motion-workspace-groups-v2';
-const LEGACY_SYNC_TABS_KEY = 'motion-workspace-tabs-v2';
-const LEGACY_STORAGE_KEY = 'motion-workspace-v1';
+const SETTINGS_STORAGE_KEY = 'motion-workspace-settings-v1';
+const MOST_USED_TABS_STORAGE_KEY = 'motion-workspace-most-used-tabs-v1';
 const SYNC_ITEM_BUDGET = 7600;
+const MOST_USED_TABS_LIMIT = 12;
+const DEFAULT_THEME = 'system';
+const themeOptions = Object.freeze([
+  { value: 'system', label: 'System' },
+  { value: 'light', label: 'Light' },
+  { value: 'dark', label: 'Dark' }
+]);
 
 const currentTabs = ref([]);
 const groups = ref([]);
+const openTabsInNewPage = ref(true);
+const hideTabListIndicator = ref(false);
+const showRecentTabsOnSearchOpen = ref(true);
+const mostUsedTabs = ref([]);
+const showTooltips = ref(true);
+const theme = ref(DEFAULT_THEME);
 const isPanelOpen = ref(false);
 const isDraggingTab = ref(false);
 const isReady = ref(false);
@@ -17,9 +29,19 @@ const activeGroupItemDrag = ref(null);
 
 let initializationPromise = null;
 let persistenceRegistered = false;
+let settingsPersistenceRegistered = false;
 let chromeListenersRegistered = false;
 let isHydrating = false;
+let isHydratingSettings = false;
 let saveGroupsPromise = Promise.resolve();
+let saveSettingsPromise = Promise.resolve();
+let lastTrackedUsageAtByUrl = new Map();
+let systemThemeMediaQuery = null;
+let systemThemeChangeHandler = null;
+let themeShortcutHandler = null;
+let systemThemeListenerRegistered = false;
+let themeShortcutListenerRegistered = false;
+
 const textEncoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
 const issuedIds = new Set();
 let nextIdCursor = Math.floor(Math.random() * 100000);
@@ -27,6 +49,7 @@ let nextIdCursor = Math.floor(Math.random() * 100000);
 const canUseChromeTabs = () => typeof chrome !== 'undefined' && Boolean(chrome.tabs?.query);
 const canUseChromeSyncStorage = () => typeof chrome !== 'undefined' && Boolean(chrome.storage?.sync);
 const canUseChromeLocalStorage = () => typeof chrome !== 'undefined' && Boolean(chrome.storage?.local);
+const canUseWindowLocalStorage = () => typeof window !== 'undefined' && Boolean(window.localStorage);
 
 const registerKnownId = (id) => {
   if (id === null || id === undefined || id === '') {
@@ -98,9 +121,61 @@ const normalizeUrlForComparison = (url) => {
   }
 };
 
+const normalizeUrlForUsage = (url) => {
+  const normalizedUrl = normalizeUrlForComparison(url);
+
+  if (!normalizedUrl || normalizedUrl.startsWith('chrome://newtab') || normalizedUrl === 'about:blank') {
+    return '';
+  }
+
+  try {
+    const parsedUrl = new URL(normalizedUrl);
+
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+      return '';
+    }
+
+    return parsedUrl.href;
+  } catch {
+    return normalizedUrl;
+  }
+};
+
+const compareMostUsedTabs = (left, right) => Number(right.useCount || 0) - Number(left.useCount || 0) || Number(right.lastUsedAt || 0) - Number(left.lastUsedAt || 0);
+
+const normalizeMostUsedTab = (item) => {
+  const normalizedUrl = normalizeUrlForUsage(item?.url || item?.key);
+
+  if (!normalizedUrl) {
+    return null;
+  }
+
+  return {
+    key: normalizedUrl,
+    title: item?.title || 'Untitled tab',
+    url: normalizedUrl,
+    favIconUrl: resolveFavIconUrl(normalizedUrl, item?.favIconUrl || ''),
+    useCount: Number.isFinite(item?.useCount) ? item.useCount : 0,
+    lastUsedAt: Number.isFinite(item?.lastUsedAt) ? item.lastUsedAt : 0
+  };
+};
+
+const sortAndLimitMostUsedTabs = (entries) => entries
+  .filter(Boolean)
+  .sort(compareMostUsedTabs)
+  .slice(0, MOST_USED_TABS_LIMIT);
+
 const resolveFavIconUrl = (url, fallback = '') => {
   if (fallback) {
-    return fallback;
+    try {
+      const fallbackUrl = new URL(fallback);
+
+      if (['http:', 'https:', 'data:', 'blob:'].includes(fallbackUrl.protocol)) {
+        return fallback;
+      }
+    } catch {
+      // Fall through to generated favicon URL.
+    }
   }
 
   const normalizedUrl = normalizeUrlForComparison(url);
@@ -122,12 +197,15 @@ const resolveFavIconUrl = (url, fallback = '') => {
   }
 };
 
+const resolveTabFavIconUrl = (tab) => resolveFavIconUrl(tabUrl(tab), tab?.favIconUrl || '');
+const resolveSavedItemFavIconUrl = (item) => resolveFavIconUrl(item?.url || 'No URL', item?.favIconUrl || '');
+
 const normalizeTabSnapshot = (tab) => ({
   tabId: typeof tab.id === 'number' ? tab.id : null,
   windowId: typeof tab.windowId === 'number' ? tab.windowId : null,
   title: tabTitle(tab),
   url: tabUrl(tab),
-  favIconUrl: resolveFavIconUrl(tabUrl(tab), tab.favIconUrl || '')
+  favIconUrl: resolveTabFavIconUrl(tab)
 });
 
 const cloneTabForGroup = (tab) => ({
@@ -144,12 +222,145 @@ const normalizeGroupItem = (item) => ({
   favIconUrl: resolveFavIconUrl(item.url || 'No URL', item.favIconUrl || '')
 });
 
-const normalizeGroup = (group, index) => ({
-  id: registerKnownId(group.id) || createId(),
-  name: (group.name || '').trim() || `Group ${index + 1}`,
-  isCollapsed: Boolean(group.isCollapsed),
-  items: Array.isArray(group.items) ? group.items.map(normalizeGroupItem) : []
+const normalizeTheme = (value) => (themeOptions.some((option) => option.value === value) ? value : DEFAULT_THEME);
+
+const applyTheme = (nextTheme = theme.value) => {
+  if (typeof document === 'undefined') {
+    return;
+  }
+
+  const root = document.documentElement;
+  const resolvedTheme = nextTheme === 'system'
+    ? (typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+    : nextTheme;
+
+  if (resolvedTheme === 'dark') {
+    root.dataset.motionTheme = 'dark';
+    return;
+  }
+
+  delete root.dataset.motionTheme;
+};
+
+const registerSystemThemeListener = () => {
+  if (systemThemeListenerRegistered || typeof window === 'undefined' || !window.matchMedia) {
+    return;
+  }
+
+  systemThemeMediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+
+  systemThemeChangeHandler = () => {
+    if (theme.value === 'system') {
+      applyTheme();
+    }
+  };
+
+  if (typeof systemThemeMediaQuery.addEventListener === 'function') {
+    systemThemeMediaQuery.addEventListener('change', systemThemeChangeHandler);
+  } else if (typeof systemThemeMediaQuery.addListener === 'function') {
+    systemThemeMediaQuery.addListener(systemThemeChangeHandler);
+  }
+
+  systemThemeListenerRegistered = true;
+};
+
+const registerThemeShortcutListener = () => {
+  if (themeShortcutListenerRegistered || typeof window === 'undefined') {
+    return;
+  }
+
+  themeShortcutHandler = (event) => {
+    if (event.repeat) {
+      return;
+    }
+
+    if (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && (event.key === 't' || event.key === 'T')) {
+      toggleTheme();
+    }
+  };
+
+  window.addEventListener('keydown', themeShortcutHandler);
+
+  themeShortcutListenerRegistered = true;
+};
+const serializeGroupCollection = (collection, tabs, tabIndexById) => collection.map((group) => {
+  const itemIndexes = [];
+
+  if (Array.isArray(group.items)) {
+    for (const item of group.items) {
+      if (!item?.id) {
+        continue;
+      }
+
+      let tabIndex = tabIndexById.get(item.id);
+
+      if (tabIndex === undefined) {
+        tabIndex = tabs.length;
+        tabs.push([
+          item.id,
+          item.title || 'Untitled tab',
+          item.url || 'No URL'
+        ]);
+        tabIndexById.set(item.id, tabIndex);
+      }
+
+      itemIndexes.push(tabIndex);
+    }
+  }
+
+  const serializedGroup = [
+    group.id,
+    group.name,
+    Boolean(group.isCollapsed) ? 1 : 0,
+    itemIndexes
+  ];
+
+  if (Array.isArray(group.groups) && group.groups.length) {
+    serializedGroup.push(serializeGroupCollection(group.groups, tabs, tabIndexById));
+  }
+
+  return serializedGroup;
 });
+
+const hydrateGroupCollection = (storedGroups, storedTabs) => {
+  if (!Array.isArray(storedGroups)) {
+    return [];
+  }
+
+  const tabEntries = Array.isArray(storedTabs)
+    ? storedTabs.map((entry) => normalizeStoredTabEntry(entry))
+    : [];
+
+  return storedGroups.map((group, index) => {
+    if (Array.isArray(group)) {
+      const itemIndexes = Array.isArray(group[3]) ? group[3] : [];
+
+      return {
+        id: registerKnownId(group[0]) || createId(),
+        name: (group[1] || '').trim() || `Group ${index + 1}`,
+        isCollapsed: Boolean(group[2]),
+        items: itemIndexes
+          .map((itemIndex) => tabEntries[itemIndex] || null)
+          .filter(Boolean)
+          .map((item) => normalizeStoredTabEntry(item))
+          .map(normalizeGroupItem),
+        groups: Array.isArray(group[4]) ? hydrateGroupsFromCollections(group[4], storedTabs) : []
+      };
+    }
+
+    return {
+      id: registerKnownId(group?.id) || createId(),
+      name: (group?.name || '').trim() || `Group ${index + 1}`,
+      isCollapsed: Boolean(group?.isCollapsed),
+      items: Array.isArray(group?.items)
+        ? group.items.map(normalizeGroupItem)
+        : [],
+      groups: Array.isArray(group?.groups)
+        ? hydrateGroupCollection(group.groups, storedTabs)
+        : []
+    };
+  });
+};
 
 const getSerializedSize = (value) => {
   const serializedValue = JSON.stringify(value);
@@ -204,41 +415,9 @@ const normalizeStoredTabEntry = (entry, fallbackId = '') => {
 const serializeWorkspace = () => {
   const tabs = [];
   const tabIndexById = new Map();
-  const serializedGroups = groups.value.map((group) => {
-    const itemIndexes = [];
-
-    if (Array.isArray(group.items)) {
-      for (const item of group.items) {
-        if (!item?.id) {
-          continue;
-        }
-
-        let tabIndex = tabIndexById.get(item.id);
-
-        if (tabIndex === undefined) {
-          tabIndex = tabs.length;
-          tabs.push([
-            item.id,
-            item.title || 'Untitled tab',
-            item.url || 'No URL'
-          ]);
-          tabIndexById.set(item.id, tabIndex);
-        }
-
-        itemIndexes.push(tabIndex);
-      }
-    }
-
-    return [
-      group.id,
-      group.name,
-      Boolean(group.isCollapsed) ? 1 : 0,
-      itemIndexes
-    ];
-  });
 
   return {
-    serializedGroups,
+    serializedGroups: serializeGroupCollection(groups.value, tabs, tabIndexById),
     tabs
   };
 };
@@ -251,9 +430,6 @@ const hydrateGroupsFromCollections = (storedGroups, storedTabs) => {
   const tabEntries = Array.isArray(storedTabs)
     ? storedTabs.map((entry) => normalizeStoredTabEntry(entry))
     : [];
-  const legacyTabEntries = !Array.isArray(storedTabs) && storedTabs && typeof storedTabs === 'object'
-    ? storedTabs
-    : null;
 
   return storedGroups.map((group, index) => {
     if (Array.isArray(group)) {
@@ -275,18 +451,9 @@ const hydrateGroupsFromCollections = (storedGroups, storedTabs) => {
       id: registerKnownId(group?.id) || createId(),
       name: (group?.name || '').trim() || `Group ${index + 1}`,
       isCollapsed: Boolean(group?.isCollapsed),
-      items: Array.isArray(group?.itemIds)
-        ? group.itemIds
-          .map((itemId) => {
-            const entry = legacyTabEntries?.[itemId];
-
-            return entry ? normalizeStoredTabEntry(entry, itemId) : null;
-          })
-          .filter(Boolean)
-          .map(normalizeGroupItem)
-        : Array.isArray(group?.items)
-          ? group.items.map(normalizeGroupItem)
-          : []
+      items: Array.isArray(group?.items)
+        ? group.items.map(normalizeGroupItem)
+        : []
     };
   });
 };
@@ -333,17 +500,11 @@ const saveGroups = async () => {
 
   const staleKeys = [
     ...getChunkKeys(STORAGE_GROUPS_CHUNK_PREFIX, Math.max(0, Number(previousMeta.groupChunkCount || 0) - groupChunks.length)).map((_, offset) => createChunkKey(STORAGE_GROUPS_CHUNK_PREFIX, groupChunks.length + offset)),
-    ...getChunkKeys(STORAGE_TABS_CHUNK_PREFIX, Math.max(0, Number(previousMeta.tabChunkCount || 0) - tabChunks.length)).map((_, offset) => createChunkKey(STORAGE_TABS_CHUNK_PREFIX, tabChunks.length + offset)),
-    LEGACY_SYNC_GROUPS_KEY,
-    LEGACY_SYNC_TABS_KEY
+    ...getChunkKeys(STORAGE_TABS_CHUNK_PREFIX, Math.max(0, Number(previousMeta.tabChunkCount || 0) - tabChunks.length)).map((_, offset) => createChunkKey(STORAGE_TABS_CHUNK_PREFIX, tabChunks.length + offset))
   ];
 
   if (staleKeys.length) {
     await chrome.storage.sync.remove(staleKeys);
-  }
-
-  if (canUseChromeLocalStorage()) {
-    await chrome.storage.local.remove(LEGACY_STORAGE_KEY);
   }
 };
 
@@ -369,7 +530,6 @@ const loadGroups = async () => {
   const syncMeta = metaResult?.[STORAGE_META_KEY];
 
   let nextGroups = [];
-  let shouldMigrate = false;
   const hasChunkedSyncSnapshot = syncMeta
     && Number.isInteger(syncMeta.groupChunkCount)
     && Number.isInteger(syncMeta.tabChunkCount);
@@ -381,43 +541,192 @@ const loadGroups = async () => {
     ]);
 
     nextGroups = hydrateGroupsFromCollections(storedGroups, storedTabs);
-  } else {
-    const legacySyncResult = await chrome.storage.sync.get([LEGACY_SYNC_GROUPS_KEY, LEGACY_SYNC_TABS_KEY]);
-    const legacySyncGroups = legacySyncResult?.[LEGACY_SYNC_GROUPS_KEY];
-    const legacySyncTabs = legacySyncResult?.[LEGACY_SYNC_TABS_KEY];
-
-    nextGroups = hydrateGroupsFromCollections(legacySyncGroups, legacySyncTabs);
-    shouldMigrate = nextGroups.length > 0;
-  }
-
-  if (!nextGroups.length && canUseChromeLocalStorage()) {
-    const legacyResult = await chrome.storage.local.get(LEGACY_STORAGE_KEY);
-    const legacyGroups = legacyResult?.[LEGACY_STORAGE_KEY];
-
-    if (Array.isArray(legacyGroups) && legacyGroups.length) {
-      nextGroups = legacyGroups.map((group, index) => normalizeGroup(group, index));
-      shouldMigrate = true;
-    }
   }
 
   isHydrating = true;
   groups.value = nextGroups;
   isHydrating = false;
+};
 
-  if (nextGroups.length && shouldMigrate) {
-    await saveGroups();
+const loadSettings = async () => {
+  if (!canUseChromeLocalStorage()) {
+    applyTheme();
+    return;
+  }
+
+  const result = await chrome.storage.local.get(SETTINGS_STORAGE_KEY);
+  const storedValue = result?.[SETTINGS_STORAGE_KEY];
+  const storedSettings = storedValue && typeof storedValue === 'object' && !Array.isArray(storedValue)
+    ? storedValue
+    : null;
+
+  isHydratingSettings = true;
+  openTabsInNewPage.value = storedSettings ? storedSettings.openTabsInNewPage !== false : storedValue !== false;
+  hideTabListIndicator.value = storedSettings ? storedSettings.hideTabListIndicator === true : false;
+  showRecentTabsOnSearchOpen.value = storedSettings ? storedSettings.showRecentTabsOnSearchOpen !== false : true;
+  showTooltips.value = storedSettings ? storedSettings.showTooltips !== false : true;
+  theme.value = normalizeTheme(storedSettings?.theme);
+  isHydratingSettings = false;
+  applyTheme(theme.value);
+};
+
+const loadMostUsedTabs = async () => {
+  let storedEntries = [];
+
+  if (canUseWindowLocalStorage()) {
+    try {
+      const storedValue = window.localStorage.getItem(MOST_USED_TABS_STORAGE_KEY);
+
+      if (storedValue) {
+        const parsedValue = JSON.parse(storedValue);
+
+        if (Array.isArray(parsedValue)) {
+          storedEntries = parsedValue;
+        }
+      }
+    } catch {
+      storedEntries = [];
+    }
+  }
+
+  if (!storedEntries.length && canUseChromeLocalStorage()) {
+    const result = await chrome.storage.local.get(MOST_USED_TABS_STORAGE_KEY);
+    storedEntries = Array.isArray(result?.[MOST_USED_TABS_STORAGE_KEY]) ? result[MOST_USED_TABS_STORAGE_KEY] : [];
+  }
+
+  mostUsedTabs.value = sortAndLimitMostUsedTabs(storedEntries.map(normalizeMostUsedTab));
+
+  if (storedEntries.length && canUseWindowLocalStorage()) {
+    try {
+      window.localStorage.setItem(MOST_USED_TABS_STORAGE_KEY, JSON.stringify(mostUsedTabs.value));
+    } catch {
+      // Ignore storage quota or availability errors.
+    }
   }
 };
 
+const saveMostUsedTabs = async () => {
+  if (canUseWindowLocalStorage()) {
+    try {
+      if (!mostUsedTabs.value.length) {
+        window.localStorage.removeItem(MOST_USED_TABS_STORAGE_KEY);
+      } else {
+        window.localStorage.setItem(MOST_USED_TABS_STORAGE_KEY, JSON.stringify(mostUsedTabs.value));
+      }
+    } catch {
+      // Ignore storage quota or availability errors.
+    }
+  }
+
+  if (!canUseChromeLocalStorage()) {
+    return;
+  }
+
+  if (!mostUsedTabs.value.length) {
+    await chrome.storage.local.remove(MOST_USED_TABS_STORAGE_KEY);
+    return;
+  }
+
+  await chrome.storage.local.set({
+    [MOST_USED_TABS_STORAGE_KEY]: mostUsedTabs.value
+  });
+};
+
+const persistMostUsedTabs = async () => {
+  if (!canUseChromeLocalStorage()) {
+    return;
+  }
+
+  await saveMostUsedTabs();
+};
+
+const trackMostUsedTab = async (tabItem) => {
+  const normalizedUrl = normalizeUrlForUsage(tabItem?.url);
+
+  if (!normalizedUrl) {
+    return;
+  }
+
+  const now = Date.now();
+  const lastTrackedAt = lastTrackedUsageAtByUrl.get(normalizedUrl) || 0;
+
+  if (now - lastTrackedAt < 1500) {
+    return;
+  }
+
+  lastTrackedUsageAtByUrl.set(normalizedUrl, now);
+
+  const nextEntry = {
+    key: normalizedUrl,
+    title: tabTitle(tabItem),
+    url: normalizedUrl,
+    favIconUrl: resolveFavIconUrl(normalizedUrl, tabItem?.favIconUrl || ''),
+    useCount: 1,
+    lastUsedAt: Date.now()
+  };
+
+  const nextEntries = mostUsedTabs.value.filter((entry) => entry.key !== normalizedUrl);
+  const existingEntry = mostUsedTabs.value.find((entry) => entry.key === normalizedUrl);
+
+  if (existingEntry) {
+    nextEntry.useCount = Number(existingEntry.useCount || 0) + 1;
+  }
+
+  mostUsedTabs.value = sortAndLimitMostUsedTabs([nextEntry, ...nextEntries]);
+  await persistMostUsedTabs();
+};
+
+// per-item removal intentionally removed — keep only clearMostUsedTabs for managing history
+
+const clearMostUsedTabs = async () => {
+  mostUsedTabs.value = [];
+  lastTrackedUsageAtByUrl.clear();
+  if (canUseWindowLocalStorage()) {
+    try {
+      window.localStorage.removeItem(MOST_USED_TABS_STORAGE_KEY);
+    } catch {
+      // Ignore storage quota or availability errors.
+    }
+  }
+  await persistMostUsedTabs();
+};
+
+const saveSettings = async () => {
+  if (!canUseChromeLocalStorage()) {
+    return;
+  }
+
+  await chrome.storage.local.set({
+    [SETTINGS_STORAGE_KEY]: {
+      openTabsInNewPage: openTabsInNewPage.value,
+      hideTabListIndicator: hideTabListIndicator.value,
+      showTooltips: showTooltips.value,
+      showRecentTabsOnSearchOpen: showRecentTabsOnSearchOpen.value,
+      theme: theme.value
+    }
+  });
+};
+
+const persistSettings = async () => {
+  if (isHydratingSettings || !canUseChromeLocalStorage()) {
+    return;
+  }
+
+  saveSettingsPromise = saveSettingsPromise
+    .catch(() => {})
+    .then(() => saveSettings());
+
+  await saveSettingsPromise;
+};
+
 const syncGroupedTabsWithCurrentTabs = () => {
-  const safeGroups = Array.isArray(groups.value) ? groups.value : [];
   const tabsById = new Map(
     currentTabs.value
       .filter((tab) => typeof tab.id === 'number')
       .map((tab) => [tab.id, normalizeTabSnapshot(tab)])
   );
 
-  groups.value = safeGroups.map((group) => ({
+  const syncGroupCollection = (collection) => collection.map((group) => ({
     ...group,
     items: Array.isArray(group.items) ? group.items.map((item) => {
       if (item.tabId === null) {
@@ -433,8 +742,11 @@ const syncGroupedTabsWithCurrentTabs = () => {
             id: item.id
           }
         : item;
-    }) : []
+    }) : [],
+    groups: Array.isArray(group.groups) ? syncGroupCollection(group.groups) : []
   }));
+
+  groups.value = syncGroupCollection(groups.value);
 };
 
 const refreshCurrentTabs = async () => {
@@ -463,6 +775,27 @@ const registerPersistence = () => {
   );
 };
 
+const registerSettingsPersistence = () => {
+  if (settingsPersistenceRegistered) {
+    return;
+  }
+
+  settingsPersistenceRegistered = true;
+
+  watch(
+    () => [openTabsInNewPage.value, hideTabListIndicator.value, showRecentTabsOnSearchOpen.value, showTooltips.value],
+    async () => {
+      await persistSettings();
+    },
+    { flush: 'sync' }
+  );
+};
+
+const toggleShowTooltips = () => {
+  showTooltips.value = !showTooltips.value;
+  void persistSettings();
+};
+
 const refreshWorkspace = async () => {
   await Promise.all([loadGroups(), refreshCurrentTabs()]);
   isReady.value = true;
@@ -477,10 +810,42 @@ const registerChromeListeners = () => {
     refreshCurrentTabs();
   };
 
+  const handleTabActivated = async (activeInfo) => {
+    refreshCurrentTabs();
+
+    try {
+      const activeTab = await chrome.tabs.get(activeInfo.tabId);
+
+      if (activeTab) {
+        await trackMostUsedTab(activeTab);
+      }
+    } catch {
+      // Ignore tabs that disappear before we can record them.
+    }
+  };
+
+  const handleTabUpdated = async (tabId, changeInfo, tab) => {
+    refreshCurrentTabs();
+
+    if (changeInfo.status !== 'complete' && !changeInfo.url) {
+      return;
+    }
+
+    try {
+      const liveTab = tab || await chrome.tabs.get(tabId);
+
+      if (liveTab?.active) {
+        await trackMostUsedTab(liveTab);
+      }
+    } catch {
+      // Ignore tabs that are gone or inaccessible.
+    }
+  };
+
   chrome.tabs.onCreated.addListener(handleTabChange);
-  chrome.tabs.onUpdated.addListener(handleTabChange);
+  chrome.tabs.onUpdated.addListener(handleTabUpdated);
   chrome.tabs.onRemoved.addListener(handleTabChange);
-  chrome.tabs.onActivated.addListener(handleTabChange);
+  chrome.tabs.onActivated.addListener(handleTabActivated);
 
   chromeListenersRegistered = true;
 };
@@ -492,15 +857,13 @@ const initializeWorkspace = async () => {
 
   initializationPromise = (async () => {
     registerPersistence();
-    await refreshWorkspace();
+    registerSystemThemeListener();
+    registerThemeShortcutListener();
+    await Promise.all([loadSettings(), loadMostUsedTabs(), refreshWorkspace()]);
     registerChromeListeners();
   })();
 
   return initializationPromise;
-};
-
-const togglePanel = async () => {
-  await setPanelOpen(!isPanelOpen.value);
 };
 
 const setPanelOpen = async (nextOpen) => {
@@ -527,6 +890,38 @@ const openPanel = async () => {
 
 const closePanel = async () => {
   await setPanelOpen(false);
+};
+
+const toggleOpenTabsInNewPage = () => {
+  openTabsInNewPage.value = !openTabsInNewPage.value;
+  void persistSettings();
+};
+
+const toggleHideTabListIndicator = () => {
+  hideTabListIndicator.value = !hideTabListIndicator.value;
+  void persistSettings();
+};
+
+const toggleShowRecentTabsOnSearchOpen = () => {
+  showRecentTabsOnSearchOpen.value = !showRecentTabsOnSearchOpen.value;
+  void persistSettings();
+};
+
+const setTheme = (nextTheme) => {
+  const normalizedTheme = normalizeTheme(nextTheme);
+
+  if (theme.value === normalizedTheme) {
+    return;
+  }
+
+  theme.value = normalizedTheme;
+  applyTheme(normalizedTheme);
+  void persistSettings();
+};
+
+const toggleTheme = () => {
+  const nextTheme = theme.value === 'dark' ? 'light' : 'dark';
+  setTheme(nextTheme);
 };
 
 const focusTab = async (tab) => {
@@ -558,6 +953,7 @@ const openSavedTab = async (tabItem) => {
 
       if (existingTab) {
         await focusTab(existingTab);
+        await trackMostUsedTab(tabItem);
         return;
       }
     } catch {
@@ -570,14 +966,28 @@ const openSavedTab = async (tabItem) => {
 
   if (matchingTab) {
     await focusTab(matchingTab);
+    await trackMostUsedTab(tabItem);
     return;
   }
 
-  const createdTab = await chrome.tabs.create({ url: targetUrl, active: true });
+  if (!openTabsInNewPage.value) {
+    const activeTabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const activeTab = activeTabs[0];
 
-  if (createdTab) {
-    await focusTab(createdTab);
+    if (activeTab?.id) {
+      await chrome.tabs.update(activeTab.id, { url: targetUrl, active: true });
+
+      if (typeof chrome.windows?.update === 'function' && typeof activeTab.windowId === 'number') {
+        await chrome.windows.update(activeTab.windowId, { focused: true });
+      }
+
+      await trackMostUsedTab(tabItem);
+      return;
+    }
   }
+
+  await chrome.tabs.create({ url: targetUrl, active: false });
+  await trackMostUsedTab(tabItem);
 };
 
 const getDragPayload = (event) => {
@@ -602,8 +1012,6 @@ const endTabDrag = () => {
   isDraggingTab.value = false;
 };
 
-const findGroupIndex = (groupId) => groups.value.findIndex((group) => group.id === groupId);
-
 const ensureGroupItems = (group) => {
   if (!Array.isArray(group.items)) {
     group.items = [];
@@ -611,6 +1019,8 @@ const ensureGroupItems = (group) => {
 
   return group.items;
 };
+
+const findGroupIndex = (groupId) => groups.value.findIndex((group) => group.id === groupId);
 
 const createGroup = (name) => {
   const trimmedName = name.trim();
@@ -882,6 +1292,7 @@ export const useWorkspaceState = () => ({
   createGroup,
   beginGroupItemDrag,
   currentTabs,
+  mostUsedTabs,
   cloneTabForGroup,
   focusTab,
   getDragPayload,
@@ -899,12 +1310,28 @@ export const useWorkspaceState = () => ({
   moveDraggedItem,
   endTabDrag,
   openSavedTab,
+  openTabsInNewPage,
+  hideTabListIndicator,
+  showRecentTabsOnSearchOpen,
   openPanel,
   renameGroup,
   startTabDrag,
+  theme,
+  themeOptions,
+  setTheme,
+  toggleTheme,
+  toggleOpenTabsInNewPage,
+  toggleHideTabListIndicator,
+  toggleShowRecentTabsOnSearchOpen,
+  showTooltips,
+  toggleShowTooltips,
+  clearMostUsedTabs,
   toggleGroupCollapsed,
   tabTitle,
   tabUrl,
+  resolveTabFavIconUrl,
+  resolveSavedItemFavIconUrl,
   setPanelOpen,
-  togglePanel
 });
+
+applyTheme();
