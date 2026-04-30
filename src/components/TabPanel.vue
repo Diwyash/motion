@@ -1,11 +1,20 @@
 <template>
-  <div
+  <button
     ref="hitAreaRef"
     class="tab-panel-hit-area"
-    aria-hidden="true"
+    :class="{ 'tab-panel-hit-area--open': isOpen, 'tab-panel-hit-area--overlay-active': isOverlayActive }"
+    type="button"
+    aria-label="Open tabs panel"
     @mouseenter="handleHoverEnter"
     @mouseleave="handleHoverLeave"
-  />
+    @click="openPanel"
+  >
+    <span v-if="!hideTabListIndicator" class="tab-panel-hit-area__indicator" aria-hidden="true">
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path d="M5 6.75A1.25 1.25 0 0 1 6.25 5.5h11.5a1.25 1.25 0 0 1 0 2.5H6.25A1.25 1.25 0 0 1 5 6.75Zm0 5.25a1.25 1.25 0 0 1 1.25-1.25h11.5a1.25 1.25 0 0 1 0 2.5H6.25A1.25 1.25 0 0 1 5 12Zm0 5.25A1.25 1.25 0 0 1 6.25 16h11.5a1.25 1.25 0 0 1 0 2.5H6.25A1.25 1.25 0 0 1 5 17.25Z" />
+      </svg>
+    </span>
+  </button>
 
   <aside
     ref="panelRef"
@@ -21,11 +30,11 @@
       </div>
     </div>
 
-    <p v-if="!currentTabs.length" class="tab-panel__empty">No tabs found.</p>
+    <p v-if="!visibleTabs.length" class="tab-panel__empty">No tabs found.</p>
 
     <Draggable
       v-else
-      v-model="currentTabs"
+      :list="visibleTabs"
       class="tab-list"
       item-key="id"
       :clone="cloneTabForGroup"
@@ -38,12 +47,12 @@
       <template #item="{ element: tab }">
         <button class="tab-list__item" type="button" @click="focusTab(tab)">
           <img
-            v-if="tab.favIconUrl"
+            v-if="getTabIconSrc(tab)"
             class="tab-list__icon"
-            :src="tab.favIconUrl"
+            :src="getTabIconSrc(tab)"
             :alt="`${tabTitle(tab)} icon`"
             loading="lazy"
-            referrerpolicy="no-referrer"
+            @error="handleTabIconError(tab)"
           />
           <span v-else class="tab-list__icon tab-list__icon--fallback" aria-hidden="true" />
 
@@ -58,13 +67,16 @@
 </template>
 
 <script setup>
-import { onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import Draggable from 'vuedraggable';
 import { useWorkspaceState } from '../composables/useWorkspaceState';
 
 const closeTimer = ref(null);
 const panelRef = ref(null);
 const hitAreaRef = ref(null);
+const isOverlayActive = ref(false);
+const CLOSE_OVERLAYS_EVENT = 'motion:close-overlays';
+const OVERLAY_STATE_EVENT = 'motion:overlay-state';
 
 const {
   currentTabs,
@@ -77,21 +89,20 @@ const {
   cloneTabForGroup,
   openPanel,
   startTabDrag,
+  hideTabListIndicator,
+  resolveTabFavIconUrl,
   tabTitle,
   tabUrl,
-  togglePanel
 } = useWorkspaceState();
+
+const visibleTabs = computed(() => currentTabs.value.filter((tab) => !tab.active));
+const brokenTabIcons = ref(new Set());
 
 void initializeWorkspace();
 
 const handleKeydown = (event) => {
   if (event.repeat || event.metaKey || event.ctrlKey || event.altKey) {
     return;
-  }
-
-  if (event.key.toLowerCase() === 'p') {
-    event.preventDefault();
-    togglePanel();
   }
 
   if (event.key === 'Escape' && isOpen.value) {
@@ -108,12 +119,33 @@ const clearCloseTimer = () => {
   }
 };
 
+const handleTabIconError = (tab) => {
+  const iconKey = tab?.id ?? tabUrl(tab);
+
+  if (iconKey !== null && iconKey !== undefined) {
+    const nextBrokenIcons = new Set(brokenTabIcons.value);
+    nextBrokenIcons.add(String(iconKey));
+    brokenTabIcons.value = nextBrokenIcons;
+  }
+};
+
+const getTabIconSrc = (tab) => {
+  const iconKey = tab?.id ?? tabUrl(tab);
+
+  if (iconKey !== null && iconKey !== undefined && brokenTabIcons.value.has(String(iconKey))) {
+    return '';
+  }
+
+  return resolveTabFavIconUrl(tab);
+};
+
 const handleHoverEnter = async () => {
   if (isDraggingTab.value) {
     return;
   }
 
   clearCloseTimer();
+  window.dispatchEvent(new CustomEvent(CLOSE_OVERLAYS_EVENT));
   await openPanel();
 };
 
@@ -155,14 +187,20 @@ const handlePointerDown = (event) => {
   closePanel();
 };
 
+const handleOverlayState = (event) => {
+  isOverlayActive.value = Boolean(event?.detail?.isOpen);
+};
+
 onMounted(() => {
   window.addEventListener('keydown', handleKeydown);
   window.addEventListener('pointerdown', handlePointerDown, true);
+  window.addEventListener(OVERLAY_STATE_EVENT, handleOverlayState);
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeydown);
   window.removeEventListener('pointerdown', handlePointerDown, true);
+  window.removeEventListener(OVERLAY_STATE_EVENT, handleOverlayState);
   clearCloseTimer();
 });
 </script>
